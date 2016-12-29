@@ -25,7 +25,6 @@
 
 #define CDV_BRIDGE_NAME @"cordova"
 #define CDV_IONIC_WK @"xhr"
-#define CDV_IONIC_STOP_SCROLL @"stopScroll"
 #define CDV_WKWEBVIEW_FILE_URL_LOAD_SELECTOR @"loadFileURL:allowingReadAccessToURL:"
 
 @interface CDVWKWeakScriptMessageHandler : NSObject <WKScriptMessageHandler>
@@ -94,7 +93,6 @@
     WKUserContentController* userContentController = [[WKUserContentController alloc] init];
     [userContentController addScriptMessageHandler:self name:CDV_BRIDGE_NAME];
     [userContentController addScriptMessageHandler:self name:CDV_IONIC_WK];
-    [userContentController addScriptMessageHandler:self name:CDV_IONIC_STOP_SCROLL];
     [userContentController addScriptMessageHandler:weakScriptMessageHandler name:CDV_BRIDGE_NAME];
 
     // Inject XHR Polyfill
@@ -371,7 +369,7 @@ static void * KVOContext = &KVOContext;
     }
     return [[WKUserScript alloc] initWithSource:source
                                   injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                               forMainFrameOnly:YES];
+                               forMainFrameOnly:NO];
 }
 
 #pragma mark WKScriptMessageHandler implementation
@@ -382,8 +380,6 @@ static void * KVOContext = &KVOContext;
         [self handleCordovaMessage: message];
     } else if ([message.name isEqualToString:CDV_IONIC_WK]) {
         [self handleXHRMessage: message];
-    } else if ([message.name isEqualToString:CDV_IONIC_STOP_SCROLL]) {
-        [self handleStopScroll];
     }
 }
 
@@ -445,31 +441,6 @@ static void * KVOContext = &KVOContext;
     [self sendXHRResponse:reqID path:url];
 }
 
-- (void)handleStopScroll
-{
-    WKWebView* wkWebView = (WKWebView*)_engineWebView;
-    NSLog(@"CDVWKWebViewEngine: handleStopScroll");
-    [self recursiveStopScroll:[wkWebView scrollView]];
-    [wkWebView evaluateJavaScript:@"window.IonicStopScroll.fire()" completionHandler:nil];
-}
-
-- (void)recursiveStopScroll:(UIView *)node
-{
-    if([node isKindOfClass: [UIScrollView class]]) {
-        UIScrollView *nodeAsScroll = (UIScrollView *)node;
-
-        if([nodeAsScroll isScrollEnabled] && ![nodeAsScroll isHidden]) {
-            [nodeAsScroll setScrollEnabled: NO];
-            [nodeAsScroll setScrollEnabled: YES];
-        }
-    }
-
-    // iterate tree recursivelly
-    for (UIView *child in [node subviews]) {
-        [self recursiveStopScroll:child];
-    }
-}
-
 - (NSURL *)xhrBaseURL
 {
     return [[[(WKWebView*)_engineWebView URL] URLByStandardizingPath] URLByDeletingLastPathComponent];
@@ -486,11 +457,6 @@ static void * KVOContext = &KVOContext;
     if ([relativePath isAbsolutePath]) {
         NSLog(@"CDVWKWebViewEngine: requested path is an absolute path");
         return nil;
-    }
-    // Remove # and ?
-    NSRange range = [relativePath rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@"#?"]];
-    if(range.location != NSNotFound) {
-        relativePath = [relativePath substringToIndex:range.location];
     }
 
     NSURL *base = [self xhrBaseURL];
@@ -530,7 +496,7 @@ static void * KVOContext = &KVOContext;
         }
 
         NSError *error = nil;
-        NSData *source = [NSData dataWithContentsOfURL:path options:0 error:&error];
+        NSString *source = [NSString stringWithContentsOfURL:path encoding:NSUTF8StringEncoding error:&error];
         if (source == nil || error != nil) {
             NSLog(@"CDVWKWebViewEngine: Error while opening file with path");
             NSLog(@"CDVWKWebViewEngine: %@", error);
@@ -538,7 +504,7 @@ static void * KVOContext = &KVOContext;
             return;
         }
 
-        NSString *content = [source base64EncodedStringWithOptions:0];
+        NSString *content = [self quoteString: source];
         if (content == nil) {
             [self js_handleXHRError:requestIdInteger errorMessage:@"file content can not be serialized. BUG!"];
             return;
@@ -548,10 +514,10 @@ static void * KVOContext = &KVOContext;
     }];
 }
 
-- (void) js_handleXHRResponse:(NSInteger)requestId content:(NSString *)base64
+- (void) js_handleXHRResponse:(NSInteger)requestId content:(NSString *)content
 {
-    NSString *jsCode = [NSString stringWithFormat:@"handleXHRResponse(%ld, \"%@\")",
-                        (long)requestId, base64];
+    NSString *jsCode = [NSString stringWithFormat:@"handleXHRResponse(%ld, %@)",
+                        (long)requestId, content];
 
     [(WKWebView*)_engineWebView evaluateJavaScript:jsCode completionHandler:nil];
 }
@@ -562,6 +528,26 @@ static void * KVOContext = &KVOContext;
                         (long)requestId, message];
 
     [(WKWebView*)_engineWebView evaluateJavaScript:jsCode completionHandler:nil];
+}
+
+- (NSString *)quoteString:(NSString *)str
+{
+    if (str == nil) {
+        NSLog(@"CDVWKWebViewEngine: String to quote is nil");
+        return nil;
+    }
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@[str] options:0 error:&error];
+    if (!data || error != nil) {
+        NSLog(@"CDVWKWebViewEngine: String escaping failed: JSON generation: %@", error);
+        return nil;
+    }
+    NSString *jsonString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    if (!jsonString || [jsonString length] < 4) {
+        NSLog(@"CDVWKWebViewEngine: String escaping failed: JSON result");
+        return nil;
+    }
+    return [jsonString substringWithRange: NSMakeRange(1, jsonString.length - 2)];
 }
 
 
@@ -611,7 +597,6 @@ static void * KVOContext = &KVOContext;
     return NO;
 }
 
-
 - (void) webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction*)navigationAction decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler
 {
     NSURL* url = [navigationAction.request URL];
@@ -635,28 +620,21 @@ static void * KVOContext = &KVOContext;
         }
     }
 
-    if (!anyPluginsResponded) {
-        /*
-         * Handle all other types of urls (tel:, sms:), and requests to load a url in the main webview.
-         */
-        shouldAllowRequest = [self defaultResourcePolicyForURL:url];
-        if (!shouldAllowRequest) {
-            [[NSNotificationCenter defaultCenter] postNotification:[NSNotification notificationWithName:CDVPluginHandleOpenURLNotification object:url]];
-        }
+    if (anyPluginsResponded) {
+        return decisionHandler(shouldAllowRequest);
     }
 
-
-    if (shouldAllowRequest) {
-        NSString *scheme = url.scheme;
-        if ([scheme isEqualToString:@"tel"] || [scheme isEqualToString:@"mailto"]) {
-            [[UIApplication sharedApplication] openURL:url];
-            decisionHandler(WKNavigationActionPolicyCancel);
-        } else {
-            decisionHandler(WKNavigationActionPolicyAllow);
-        }
+    /*
+     * Handle all other types of urls (tel:, sms:), and requests to load a url in the main webview.
+     */
+    BOOL shouldAllowNavigation = [self defaultResourcePolicyForURL:url];
+    if (shouldAllowNavigation) {
+        return decisionHandler(YES);
     } else {
-        decisionHandler(WKNavigationActionPolicyCancel);
+        [[NSNotificationCenter defaultCenter] postNotification:[NSNotification notificationWithName:CDVPluginHandleOpenURLNotification object:url]];
     }
+
+    return decisionHandler(NO);
 }
 
 @end
